@@ -5,11 +5,12 @@ import gspread
 from google.oauth2.service_account import Credentials
 import time
 import json
+import re
 
 # --- UI 설정 ---
 st.set_page_config(page_title="주관식 답변 분석기", layout="wide", page_icon="📝")
-st.title("📝 주관식 답변 자동화 분석기")
-st.info("이미지, 강점, 보완, 장애요인 등 서술형 답변을 3단계(추출 → 정리 → 그룹화)로 분석합니다.")
+st.title("📝 주관식 답변 자동화 분석기 (Smart Split)")
+st.info("3단계 분석 결과가 10개를 넘어가면 자동으로 다음 칸(열)에 나누어 저장합니다.")
 
 # --- API & Google Auth 설정 ---
 try:
@@ -42,7 +43,7 @@ def call_gpt(text, prompt_template):
         response = client.chat.completions.create(
             model="gpt-5",
             messages=[{"role": "user", "content": prompt}],
-       )
+        )
         return response.choices[0].message.content.strip()
     except Exception as e:
         return f"GPT 오류: {e}"
@@ -57,7 +58,7 @@ def ensure_columns(ws, needed):
 # --------------------------------------------------------------------------
 
 # 1단계: 핵심 문장 추출 (Point Form)
-PROMPT_EXTRACT = """ # 문장 추출 및 정규화 예제
+PROMPT_EXTRACT = """# 문장 추출 및 정규화 예제
 ## case 1
 ### input없음. 옛날 직장인?
 ### outputㆍ 옛날 직장인
@@ -170,7 +171,100 @@ PROMPT_GROUPING = """다음 텍스트를 분석하여 유사한 주제끼리 묶
 """
 
 # --------------------------------------------------------------------------
-# [실행 메인 로직]
+# [핵심 로직: 주관식 분석 및 자동 분할 저장]
+# --------------------------------------------------------------------------
+
+def run_qualitative_analysis(sh, sheet_name):
+    try:
+        ws = sh.worksheet(sheet_name)
+    except gspread.exceptions.WorksheetNotFound:
+        st.error(f"오류: '{sheet_name}' 워크시트를 찾을 수 없습니다.")
+        return
+
+    data = ws.get_all_values()
+    if not data:
+        st.error("데이터가 없습니다.")
+        return
+
+    headers = data[0]
+    
+    # 기본 결과 열 2개 (Point Form, Summary) + 그룹화 시작 열(Thematic Grouping 1)
+    base_result_col_start = len(headers) + 1
+    ensure_columns(ws, base_result_col_start + 2) 
+    
+    # 기본 헤더 업데이트
+    ws.update_cell(1, base_result_col_start, "Point Form (B)")
+    ws.update_cell(1, base_result_col_start + 1, "Summary (C)")
+    ws.update_cell(1, base_result_col_start + 2, "Thematic Grouping (1-10)") # 첫번째 그룹화 열
+
+    df = pd.DataFrame(data[1:], columns=headers)
+    progress_bar = st.progress(0)
+    status_text = st.empty()
+    
+    for i, row in df.iterrows():
+        idx = i + 2
+        input_text = row.iloc[1] # B열 데이터 사용
+        
+        if not input_text or pd.isna(input_text):
+            progress_bar.progress((i + 1) / len(df))
+            continue
+
+        # 1단계: 추출
+        status_text.info(f"행 {idx}: (1/3) 핵심 추출 중...")
+        r1 = call_gpt(input_text, PROMPT_EXTRACT)
+        ws.update_cell(idx, base_result_col_start, r1)
+        time.sleep(0.5)
+
+        # 2단계: 정리
+        status_text.info(f"행 {idx}: (2/3) 요약 정리 중...")
+        r2 = call_gpt(r1, PROMPT_FORMAT)
+        ws.update_cell(idx, base_result_col_start + 1, r2)
+        time.sleep(0.5)
+
+        # 3단계: 그룹화 및 10개 단위 분할 저장 (★핵심 기능★)
+        status_text.info(f"행 {idx}: (3/3) 그룹화 및 분할 저장 중...")
+        r3 = call_gpt(r2, PROMPT_GROUPING)
+        
+        # 3-1. 결과 텍스트를 줄 단위로 분리 (빈 줄 제외)
+        lines = [line.strip() for line in r3.split('\n') if line.strip()]
+        
+        # 3-2. 10개씩 자르기 (Chunking)
+        chunk_size = 10
+        chunks = [lines[j:j + chunk_size] for j in range(0, len(lines), chunk_size)]
+        
+        if not chunks: chunks = ["응답 없음"] # 결과가 없을 경우 예외처리
+
+        # 3-3. 각 덩어리를 옆으로 칸을 늘려가며 저장
+        grouping_start_col = base_result_col_start + 2
+        
+        # 필요한 만큼 열 확장
+        ensure_columns(ws, grouping_start_col + len(chunks))
+        
+        for k, chunk in enumerate(chunks):
+            # 리스트를 다시 하나의 문자열로 합침
+            cell_content = "\n".join(chunk)
+            
+            # 현재 저장할 열 위치 (D열부터 시작해서 E, F... 로 이동)
+            target_col = grouping_start_col + k
+            
+            # 헤더가 비어있으면 채워줌 (ex: Thematic Grouping 2, 3...)
+            if k > 0: # 첫번째 그룹화 열은 위에서 이미 만듦
+                current_header = ws.cell(1, target_col).value
+                if not current_header:
+                    header_label = f"Thematic Grouping ({k*10+1}-{(k+1)*10})"
+                    ws.update_cell(1, target_col, header_label)
+            
+            # 셀 업데이트
+            ws.update_cell(idx, target_col, cell_content)
+
+        progress_bar.progress((i + 1) / len(df))
+        
+    status_text.empty()
+    st.success(f"✅ '{sheet_name}' 분석 및 분할 저장이 완료되었습니다!")
+    st.balloons()
+
+# --------------------------------------------------------------------------
+# [메인 실행]
 # --------------------------------------------------------------------------
 
 def main():
@@ -197,61 +291,8 @@ def main():
         
         try:
             sh = gc.open_by_url(url_input)
-            ws = sh.worksheet(worksheet_name)
-            data = ws.get_all_values()
-            
-            if not data:
-                st.error("시트에 데이터가 없습니다.")
-                return
+            run_qualitative_analysis(sh, worksheet_name)
 
-            headers = data[0]
-            # 결과 열 3개 추가 (Point Form, Summary, Thematic Grouping)
-            ensure_columns(ws, len(headers) + 3)
-            
-            # 헤더 쓰기
-            ws.update_cell(1, len(headers) + 1, "Point Form (B)")
-            ws.update_cell(1, len(headers) + 2, "Summary (C)")
-            ws.update_cell(1, len(headers) + 3, "Thematic Grouping (D)")
-
-            df = pd.DataFrame(data[1:], columns=headers)
-            progress_bar = st.progress(0)
-            
-            status_text = st.empty()
-            
-            for i, row in df.iterrows():
-                row_num = i + 2
-                input_text = row.iloc[1] # B열(인덱스 1) 데이터 사용
-                
-                if not input_text or pd.isna(input_text):
-                    progress_bar.progress((i + 1) / len(df))
-                    continue
-
-                status_text.info(f"행 {row_num}/{len(df)+1} 처리 중... (1/3 단계)")
-                # 1단계: 추출
-                res1 = call_gpt(input_text, PROMPT_EXTRACT)
-                ws.update_cell(row_num, len(headers) + 1, res1)
-                time.sleep(0.5)
-
-                status_text.info(f"행 {row_num}/{len(df)+1} 처리 중... (2/3 단계)")
-                # 2단계: 정리
-                res2 = call_gpt(res1, PROMPT_FORMAT)
-                ws.update_cell(row_num, len(headers) + 2, res2)
-                time.sleep(0.5)
-
-                status_text.info(f"행 {row_num}/{len(df)+1} 처리 중... (3/3 단계)")
-                # 3단계: 그룹화
-                res3 = call_gpt(res2, PROMPT_GROUPING)
-                ws.update_cell(row_num, len(headers) + 3, res3)
-                time.sleep(0.5)
-                
-                progress_bar.progress((i + 1) / len(df))
-            
-            status_text.empty()
-            st.success(f"✅ '{worksheet_name}' 분석이 완료되었습니다!")
-            st.balloons()
-
-        except gspread.exceptions.WorksheetNotFound:
-            st.error(f"오류: 시트 내에 '{worksheet_name}' 워크시트가 없습니다.")
         except Exception as e:
             st.error(f"실행 중 오류 발생: {e}")
 
