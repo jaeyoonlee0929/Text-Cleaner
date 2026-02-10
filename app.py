@@ -12,7 +12,7 @@ st.title("📝 주관식 답변 자동화 분석기")
 st.info("이미지, 강점, 보완, 장애요인 등 서술형 답변을 3단계로 분석하고, 분량에 맞춰 자동으로 나누어 저장합니다.")
 
 # --- 설정값 (PPT 슬라이드 분할 기준) ---
-MAX_CHARS_PER_CELL = 1000  # 한 셀(슬라이드)당 최대 글자 수
+MAX_CHARS_PER_CELL = 600  # 한 셀(슬라이드)당 최대 글자 수
 MAX_LINES_PER_CELL = 10    # 한 셀(슬라이드)당 최대 줄 수
 
 # --- API & Google Auth 설정 ---
@@ -246,14 +246,14 @@ def run_analysis(sh, sheet_name):
             if (len(current_chunk) >= MAX_LINES_PER_CELL) or \
                (current_char_count + line_length > MAX_CHARS_PER_CELL):
                 
-                if current_chunk: chunks.append("\n".join(current_chunk))
+                if current_chunk: chunks.append("\n\n".join(current_chunk))
                 current_chunk = [line]
                 current_char_count = line_length
             else:
                 current_chunk.append(line)
                 current_char_count += line_length
         
-        if current_chunk: chunks.append("\n".join(current_chunk))
+        if current_chunk: chunks.append("\n\n".join(current_chunk))
         if not chunks: chunks = ["응답 없음"]
 
         # 분할된 덩어리 저장
@@ -308,4 +308,5 @@ def main():
 
 if __name__ == "__main__":
     main()
+
 
