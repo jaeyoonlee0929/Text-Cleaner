@@ -5,15 +5,17 @@ import gspread
 from google.oauth2.service_account import Credentials
 import time
 import json
+import re
 
 # --- UI 설정 ---
 st.set_page_config(page_title="주관식 답변 분석기", layout="wide", page_icon="📝")
 st.title("📝 주관식 답변 자동화 분석기")
-st.info("이미지, 강점, 보완, 장애요인 등 서술형 답변을 3단계로 분석하고, 분량에 맞춰 자동으로 나누어 저장합니다.")
+st.info("화이팅입니다!")
 
-# --- 설정값 (PPT 슬라이드 분할 기준) ---
-MAX_CHARS_PER_CELL = 800  # 한 셀(슬라이드)당 최대 글자 수
-MAX_LINES_PER_CELL = 10    # 한 셀(슬라이드)당 최대 줄 수
+# --- 설정값 ---
+MAX_CHARS_PER_CELL = 800  # 한 셀당 최대 글자 수
+MAX_LINES_PER_CELL = 10    # 한 셀당 최대 포인트 개수
+GROUPING_THRESHOLD = 5     # 그룹화를 진행할 최소 포인트 개수 (이 값보다 많으면 그룹화)
 
 # --- API & Google Auth 설정 ---
 try:
@@ -43,7 +45,6 @@ def call_gpt(text, prompt_template):
     if pd.isna(text) or str(text).strip() == "": return "응답 없음"
     prompt = prompt_template.format(text=text)
     
-    # 재시도 로직
     for attempt in range(3):
         try:
             response = client.chat.completions.create(
@@ -160,7 +161,7 @@ PROMPT_FORMAT = """ㆍ 기준으로 줄바꿈을 해주세요. ㆍ 는 지우지
 # [3단계] 주제별 그룹화
 PROMPT_GROUPING = """다음 텍스트를 분석하여 유사한 주제끼리 묶어주세요.
 각 주제별로 적절한 타이틀(키워드)을 달고, 아래 형식에 맞춰 작성해주세요.
-내용은 입력된 문장의 그대로 유지하며 나열해주세요.
+내용은 입력된 문장을 그대로 유지하며 나열해주세요.
 
 **주의사항:**
 1. 각 줄 사이에는 빈 줄(엔터)을 넣지 말고, 바로 다음 줄에 내용을 이어 작성해주세요.
@@ -168,10 +169,6 @@ PROMPT_GROUPING = """다음 텍스트를 분석하여 유사한 주제끼리 묶
 
 형식:
 ㆍ [주제] : 내용1; 내용2
-
-예시:
-ㆍ [소통] : 위클리 뿐만 아니라, 직책자에게 공유 되는 내용 중 구성원이 알아야하는 내용에 대해서는 반드시 공유; 격의 없는 소통을 위해 서로 영어 이름을 부름
-ㆍ [업무 효율] : 불필요한 회의를 줄이고 핵심 안건 위주로 짧게 진행함
 
 입력 텍스트:
 {text}
@@ -194,8 +191,7 @@ def run_analysis(sh, sheet_name):
         return
 
     headers = data[0]
-    # 2열(B열)에 원본 데이터가 있다고 가정
-    input_col_idx = 1 
+    input_col_idx = 1 # 2열(B열)
     
     # 기본 결과 열 시작 위치
     base_result_col_start = len(headers) + 1
@@ -204,7 +200,7 @@ def run_analysis(sh, sheet_name):
     # 기본 헤더 업데이트
     ws.update_cell(1, base_result_col_start, "Point Form (B)")
     ws.update_cell(1, base_result_col_start + 1, "Summary (C)")
-    ws.update_cell(1, base_result_col_start + 2, "Thematic Grouping (Slide 1)")
+    ws.update_cell(1, base_result_col_start + 2, "Final Result (Slide 1)")
 
     df = pd.DataFrame(data[1:], columns=headers)
     progress_bar = st.progress(0)
@@ -230,11 +226,24 @@ def run_analysis(sh, sheet_name):
         ws.update_cell(idx, base_result_col_start + 1, r2)
         time.sleep(0.5)
 
-        # 3단계: 그룹화 및 스마트 분할 저장
-        status_text.info(f"행 {idx}: (3/3) 그룹화 및 스마트 분할 저장 중...")
-        r3 = call_gpt(r2, PROMPT_GROUPING)
+        # --- [조건부 로직 추가] ---
+        # r2의 줄 수(포인트 개수)를 셉니다.
+        r2_lines = [line.strip() for line in r2.split('\n') if line.strip()]
+        point_count = len(r2_lines)
+
+        r3 = ""
+        if point_count <= GROUPING_THRESHOLD:
+            # 5개 이하: 그룹화 생략 (r2 내용 그대로 사용)
+            status_text.info(f"행 {idx}: (3/3) 포인트 {point_count}개 - 그룹화 생략하고 저장 중...")
+            r3 = r2 
+        else:
+            # 5개 초과: 그룹화 수행
+            status_text.info(f"행 {idx}: (3/3) 포인트 {point_count}개 - 주제별 그룹화 수행 중...")
+            r3 = call_gpt(r2, PROMPT_GROUPING)
         
-        # --- [Smart Split Logic V2] ---
+        time.sleep(0.5)
+        
+        # --- [Smart Split Logic V3: 줄 띄움 적용] ---
         lines = [line.strip() for line in r3.split('\n') if line.strip()]
         chunks = []
         current_chunk = []
@@ -242,18 +251,19 @@ def run_analysis(sh, sheet_name):
         
         for line in lines:
             line_length = len(line)
-            # 조건: (현재 줄 수 >= 최대 줄 수) OR (현재 글자 수 + 새 줄 글자 수 > 최대 글자 수)
             if (len(current_chunk) >= MAX_LINES_PER_CELL) or \
                (current_char_count + line_length > MAX_CHARS_PER_CELL):
-                
-                if current_chunk: chunks.append("\n\n".join(current_chunk))
+                if current_chunk: 
+                    chunks.append("\n\n".join(current_chunk))
                 current_chunk = [line]
                 current_char_count = line_length
             else:
                 current_chunk.append(line)
                 current_char_count += line_length
         
-        if current_chunk: chunks.append("\n\n".join(current_chunk))
+        if current_chunk: 
+            chunks.append("\n\n".join(current_chunk))
+            
         if not chunks: chunks = ["응답 없음"]
 
         # 분할된 덩어리 저장
@@ -267,7 +277,7 @@ def run_analysis(sh, sheet_name):
             if k > 0:
                 current_header = ws.cell(1, target_col).value
                 if not current_header:
-                    ws.update_cell(1, target_col, f"Thematic Grouping (Slide {k+1})")
+                    ws.update_cell(1, target_col, f"Final Result (Slide {k+1})")
             
             ws.update_cell(idx, target_col, chunk)
         # -----------------------------
@@ -278,15 +288,12 @@ def run_analysis(sh, sheet_name):
     st.success(f"✅ '{sheet_name}' 분석이 완료되었습니다!")
     st.balloons()
 
-
 # --- 메인 실행 ---
-
 def main():
     col1, col2 = st.columns([3, 1])
     with col1:
         url = st.text_input("1. 분석할 구글 스프레드시트 URL 입력:")
     with col2:
-        # 주관식 분석 유형만 남김
         target_sheet = st.selectbox("2. 분석할 시트 이름 선택:", [
             "이미지", 
             "강점", 
@@ -308,7 +315,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
-
-
-
